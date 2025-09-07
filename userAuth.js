@@ -7,12 +7,32 @@ const BOOKING=require("./Model/booking");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken")
 
+const dotenv = require("dotenv");
+dotenv.config();
+
+
 // IMAGES HANDLING
 const imageDownloader=require("image-downloader");
 const multer=require('multer');
+const fs = require('fs');
+const path = require('path');
+
+// SUPABASE SETUP
+const { createClient } = require('@supabase/supabase-js');
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
 
 
-router.use('/uploads',express.static(__dirname+"/uploads"))
+// Static file serving removed - now handled by Supabase
+// router.use('/uploads',express.static(__dirname+"/uploads"))
+
+// Helper function to get public URL from Supabase
+const getSupabaseImageUrl = (fileName) => {
+  const { data } = supabase.storage.from('hotel-images').getPublicUrl(fileName);
+  return data.publicUrl;
+};
 
 const {validateUser} =require ("./validate");
 const TEMP = require("./Model/tempBooking");
@@ -142,26 +162,124 @@ router.get("/profile",async(req,res)=>{
 
 // IMAGES
 router.post("/upload-by-link",async (req,res)=>{
-    const {link}=req.body;
-    
-    const newImageName= 'photo'+Date.now()+".jpg";
+    try {
+        const {link}=req.body;
+        
+        const newImageName= 'photo'+Date.now()+".jpg";
+        const tempPath = __dirname+'/temp_'+newImageName;
 
-    const options={
-        url:link,
-        dest:__dirname+'/uploads/'+newImageName
+        const options={
+            url:link,
+            dest: tempPath
+        }
+        
+        // Download image temporarily
+        await imageDownloader.image(options);
+        
+        // Read the downloaded file
+        const fileBuffer = fs.readFileSync(tempPath);
+        
+        // Upload to Supabase
+        const { data, error } = await supabase.storage
+            .from('hotel-images')
+            .upload(newImageName, fileBuffer, {
+                contentType: 'image/jpeg',
+                upsert: false
+            });
+
+        // Clean up temporary file
+        fs.unlinkSync(tempPath);
+
+        if (error) {
+            console.error('Supabase upload error:', error);
+            return res.status(500).json({ error: 'Failed to upload image to storage' });
+        }
+
+        // Return just the filename for database storage
+        // Frontend will call /image/:filename to get the public URL
+        res.json(newImageName);
+        
+    } catch (error) {
+        console.error('Upload by link error:', error);
+        res.status(500).json({ error: 'Failed to process image upload' });
     }
-    
-   await imageDownloader.image(options);
-
-   res.json(newImageName);
-    
 })
 
 // handling photos uploaded locally by machine
-const photosMiddleware=multer({dest:'uploads/'})
-router.post("/upload", photosMiddleware.single('photo'),(req, res) => {
-    res.json(req.file);
+const photosMiddleware=multer({dest:'temp_uploads/'})
+router.post("/upload", photosMiddleware.single('photo'), async (req, res) => {
+    try {
+        if (!req.file) {
+            return res.status(400).json({ error: 'No file uploaded' });
+        }
+
+        const originalName = req.file.originalname;
+        const fileExtension = path.extname(originalName);
+        const newImageName = 'photo' + Date.now() + fileExtension;
+        
+        // Read the uploaded file
+        const fileBuffer = fs.readFileSync(req.file.path);
+        
+        // Determine content type
+        const contentType = req.file.mimetype || 'image/jpeg';
+        
+        // Upload to Supabase
+        const { data, error } = await supabase.storage
+            .from('hotel-images')
+            .upload(newImageName, fileBuffer, {
+                contentType: contentType,
+                upsert: false
+            });
+
+        // Clean up temporary file
+        fs.unlinkSync(req.file.path);
+
+        if (error) {
+            console.error('Supabase upload error:', error);
+            return res.status(500).json({ error: 'Failed to upload image to storage' });
+        }
+
+        // Return just the filename for database storage  
+        // Frontend will call /image/:filename to get the public URL
+        res.json(newImageName);
+        
+    } catch (error) {
+        console.error('Upload error:', error);
+        res.status(500).json({ error: 'Failed to process file upload' });
+    }
 })
+
+// Get image URL from Supabase
+router.get("/image/:filename", (req, res) => {
+    try {
+        const { filename } = req.params;
+        const publicUrl = getSupabaseImageUrl(filename);
+        res.json({ url: publicUrl });
+    } catch (error) {
+        console.error('Error getting image URL:', error);
+        res.status(500).json({ error: 'Failed to get image URL' });
+    }
+});
+
+// Get multiple image URLs from Supabase
+router.post("/images", (req, res) => {
+    try {
+        const { filenames } = req.body;
+        if (!Array.isArray(filenames)) {
+            return res.status(400).json({ error: 'filenames must be an array' });
+        }
+        
+        const imageUrls = filenames.map(filename => ({
+            filename,
+            url: getSupabaseImageUrl(filename)
+        }));
+        
+        res.json(imageUrls);
+    } catch (error) {
+        console.error('Error getting image URLs:', error);
+        res.status(500).json({ error: 'Failed to get image URLs' });
+    }
+});
 
 
 // USER
@@ -218,19 +336,55 @@ router.post("/places",async(req,res)=>{
 
 //        for host to see his added/hosted places
 router.get("/userPlaces",async(req,res)=>{
-    const authUser = req.headers.token;
-    const {id} = jwt.verify(authUser, process.env.USER_TOKEN);
+    try {
+        const authUser = req.headers.token;
+        const {id} = jwt.verify(authUser, process.env.USER_TOKEN);
 
-    const ownerPlaces=await PLACES.find({owner:id});
-    // console.log(ownerPlaces)
-    res.json(ownerPlaces);
+        const ownerPlaces = await PLACES.find({owner:id});
+        
+        // Add image URLs to each place
+        const placesWithImages = ownerPlaces.map(place => {
+            const placeObj = place.toObject();
+            if (placeObj.photos && placeObj.photos.length > 0) {
+                placeObj.photoUrls = placeObj.photos.map(filename => ({
+                    filename,
+                    url: getSupabaseImageUrl(filename)
+                }));
+            }
+            return placeObj;
+        });
+        
+        res.json(placesWithImages);
+    } catch (error) {
+        console.error('Error getting user places:', error);
+        res.status(500).json({ error: 'Failed to get user places' });
+    }
 })
 
 // for host (to update teh form) for user (to see details from the landing page)
 router.get('/places/:id',async(req,res)=>{
-    const {id}=req.params;
-    const place=await PLACES.findById(id);
-    res.json(place)
+    try {
+        const {id}=req.params;
+        const place=await PLACES.findById(id);
+        
+        if (!place) {
+            return res.status(404).json({ error: 'Place not found' });
+        }
+        
+        // Convert place to object and add image URLs
+        const placeObj = place.toObject();
+        if (placeObj.photos && placeObj.photos.length > 0) {
+            placeObj.photoUrls = placeObj.photos.map(filename => ({
+                filename,
+                url: getSupabaseImageUrl(filename)
+            }));
+        }
+        
+        res.json(placeObj);
+    } catch (error) {
+        console.error('Error getting place:', error);
+        res.status(500).json({ error: 'Failed to get place details' });
+    }
 })
 // update the  places by host
 router.put("/places/", async (req,res)=>{
@@ -282,10 +436,26 @@ router.put("/places/", async (req,res)=>{
 
 // for user at the landing page
 router.get('/places' , async(req,res)=>{
-
-    const places= await PLACES.find();
-    res.json(places);
-
+    try {
+        const places = await PLACES.find();
+        
+        // Add image URLs to each place
+        const placesWithImages = places.map(place => {
+            const placeObj = place.toObject();
+            if (placeObj.photos && placeObj.photos.length > 0) {
+                placeObj.photoUrls = placeObj.photos.map(filename => ({
+                    filename,
+                    url: getSupabaseImageUrl(filename)
+                }));
+            }
+            return placeObj;
+        });
+        
+        res.json(placesWithImages);
+    } catch (error) {
+        console.error('Error getting places:', error);
+        res.status(500).json({ error: 'Failed to get places' });
+    }
 })
 
 
