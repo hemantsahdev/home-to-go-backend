@@ -3,7 +3,7 @@ const app=express();
 
 const cors=require("cors");
 app.use(cors({ origin: "*" }));   // allow all origins
-
+app.options("*", cors()); 
 // optional: allow all methods and headers explicitly
 app.use(cors({
   origin: "*",
