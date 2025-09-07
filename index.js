@@ -2,7 +2,14 @@ const express=require ("express");
 const app=express();
 
 const cors=require("cors");
-app.use(cors());
+app.use(cors({ origin: "*" }));   // allow all origins
+
+// optional: allow all methods and headers explicitly
+app.use(cors({
+  origin: "*",
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"]
+}));
 
 const userAuth=require("./userAuth");
 // pass cfB3QQJHpPosT9Uv
